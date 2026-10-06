@@ -401,6 +401,7 @@ def _prepare_precompiler_for_fork(
             cast("Any", extracted.kernel),
             config,
             cast("BoundKernel", kernel),
+            device_args=args,
         )(*extracted.args, **extracted.kwargs)
         if precompiler is already_compiled:
             return None

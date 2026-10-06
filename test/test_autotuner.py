@@ -1022,7 +1022,9 @@ class TestAutotuneIgnoreErrors(TestCase):
         def fake_lazy_init() -> None:
             lazy_calls.append(os.getpid())
 
-        def fake_make_precompiler(_kernel_obj, _config, _bound_kernel):
+        def fake_make_precompiler(_kernel_obj, _config, _bound_kernel, *, device_args):
+            self.assertEqual(device_args, ("arg0",))
+
             def binder(*_args: object, **_kwargs: object):
                 def run() -> None:
                     return None

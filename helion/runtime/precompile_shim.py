@@ -53,7 +53,10 @@ def make_precompiler(
     fn: JITFunction[object],
     config: Config,
     bound_kernel: BoundKernel,
+    *,
+    device_args: Sequence[object] = (),
 ) -> Callable[..., Callable[[], bool]]:
+    from .kernel import _canonicalize_argument_device
     from .kernel import _find_device
 
     def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], bool]:
@@ -64,8 +67,11 @@ def make_precompiler(
         """
         # pyrefly: ignore [bad-argument-type]
         args, kwargs = compile_only_launch_args(*args, **kwargs)
-        # pyrefly: ignore [bad-argument-type]
-        device = _find_device(_device_probe_values([*args, *kwargs.values()]))
+        # Lowering can replace every tensor with a TensorDescriptor. Preserve
+        # device discovery from the original call before considering launch args.
+        device = _canonicalize_argument_device(
+            _find_device(_device_probe_values([*device_args, *args, *kwargs.values()]))
+        )
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )
