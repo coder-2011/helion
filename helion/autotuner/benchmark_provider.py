@@ -438,6 +438,9 @@ class BenchmarkResult(NamedTuple):
         "source_rejected",
     ]
     compile_time: float | None
+    # Monotonic completion time, captured before later trials in the batch.
+    # Optional for compatibility with custom benchmark providers.
+    completed_at: float | None = None
 
 
 class IsolatedBenchmarkFailure(NamedTuple):
@@ -714,6 +717,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 perf=source_result.perf,
                 status="deduplicated",
                 compile_time=None,
+                completed_at=source_result.completed_at,
             )
             repaired[pending.config] = repair
             self._effective_source_repairs[pending.config] = repair
@@ -731,6 +735,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         config_id=pending.config_id,
                         config=pending.config,
                         source_hash=source_hash,
+                        completed_at=repair.completed_at,
                     )
                 )
         return repaired
@@ -1308,6 +1313,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
+                results[i] = results[i]._replace(completed_at=time.perf_counter())
                 raise_if_no_viable_config = (
                     not compiled
                     and i == len(all_configs) - 1
@@ -1315,6 +1321,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     == 0
                 )
                 self._record_compile_failure(config)
+                source_hash = None
                 if deduplicate_sources:
                     # No callable exists to carry generated-source identity, but
                     # strict source ledgers still need an auditable terminal row.
@@ -1322,19 +1329,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     if source_hash not in seen_sources:
                         seen_sources.add(source_hash)
                         self._autotune_metrics.num_unique_sources += 1
-                    config_id = self.log.register_config(config)
-                    if config_id is not None:
-                        self.log.record_autotune_entry(
-                            AutotuneLogEntry(
-                                generation=self._autotune_metrics.num_generations,
-                                status="error",
-                                perf_ms=None,
-                                compile_time=None,
-                                config_id=config_id,
-                                config=config,
-                                source_hash=source_hash,
-                            )
+                config_id = (
+                    self.log.register_config(config)
+                    if deduplicate_sources or self.log.trace_enabled
+                    else None
+                )
+                if config_id is not None:
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status="error",
+                            perf_ms=None,
+                            compile_time=None,
+                            config_id=config_id,
+                            config=config,
+                            source_hash=source_hash,
+                            completed_at=results[i].completed_at,
                         )
+                    )
                 maybe_dump_triton_failure(
                     self.kernel, config, e, captured_output=captured[0] or None
                 )
@@ -1372,6 +1384,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     config_id=config_id,
                     config=all_configs[index],
                     source_hash=source_hashes.get(index),
+                    completed_at=result.completed_at,
                 )
             )
 
@@ -1417,6 +1430,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=cached_result.perf,
                     status="deduplicated",
                     compile_time=None,
+                    completed_at=time.perf_counter(),
                 )
                 deduplicated_indices.add(index)
                 self._autotune_metrics.num_source_deduplications += 1
@@ -1503,6 +1517,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                    completed_at=time.perf_counter(),
                 )
                 self._autotune_metrics.num_source_deduplications += 1
                 record_final_result(result_index, config_id, compile_time)
@@ -1514,6 +1529,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=source_result.perf,
                     status=status,
                     compile_time=None,
+                    completed_at=time.perf_counter(),
                 )
                 deduplicated_indices.add(result_index)
                 self._autotune_metrics.num_source_deduplications += 1
@@ -1565,6 +1581,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
+                    completed_at=time.perf_counter(),
                 )
                 # Keep the actual terminal outcome even when a later source
                 # alias repairs this candidate. The repair is logged as a
@@ -1580,6 +1597,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                    completed_at=time.perf_counter(),
                 )
                 record_final_result(result_index, config_id, compile_time)
             result = results[result_index]
@@ -1637,9 +1655,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         config_id=config_id,
                         config=config,
                         source_hash=source_hash,
+                        completed_at=result.completed_at,
                     )
                 )
-        return results
+        # Budget-tail placeholders become terminal only when this batch ends.
+        return [
+            result
+            if result.completed_at is not None
+            else result._replace(completed_at=time.perf_counter())
+            for result in results
+        ]
 
     def _clear_jit_fast_path_caches(self, fn: CompiledConfig) -> None:
         """Clear Triton JIT fast-path caches for this generated wrapper.
@@ -2210,6 +2235,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
         child_log = copy.copy(log)
         child_log._log_sink = None
+        child_log._trace_sink = None
         case_index = 0
         try:
             for index, (case_kernel, case_args) in enumerate(args.cases):
@@ -2380,7 +2406,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             return []
         if check_budget and self.budget_exceeded_fn():
             return [
-                BenchmarkResult(config, _unset_fn, inf, "error", None)
+                BenchmarkResult(
+                    config, _unset_fn, inf, "error", None, time.perf_counter()
+                )
                 for config in configs
             ]
 
@@ -2395,6 +2423,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     _materialize_multi_shape_config(self.config_spec, config)
                 )
             except exc.InvalidConfig as error:
+                results[config_index] = results[config_index]._replace(
+                    completed_at=time.perf_counter()
+                )
                 self.log.debug(
                     f"Skipping config that is invalid for the anchor shape: {error}"
                 )
@@ -2536,6 +2567,13 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 perf=perf,
                 status=status,
                 compile_time=compile_time,
+                # A joint trial completes when its last shape completes, not
+                # when the provider finishes aggregating the entire batch.
+                completed_at=(
+                    max(cast("float", result.completed_at) for result in row)
+                    if all(result.completed_at is not None for result in row)
+                    else time.perf_counter()
+                ),
             )
             results[config_index] = result
             if self._collect_effective_source_repairs and not math.isfinite(perf):
@@ -2606,6 +2644,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                         perf=perf,
                         status="deduplicated",
                         compile_time=None,
+                        completed_at=repair.completed_at,
                     )
                 self._original_configs_by_materialized_key.pop(key, None)
                 self._anchor_fns_by_materialized_key.pop(key, None)
@@ -2629,7 +2668,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 f"arg_sets[{case_index}] after {type(error).__name__}: {error}"
             )
             return [
-                BenchmarkResult(config, _unset_fn, inf, "error", None)
+                BenchmarkResult(
+                    config, _unset_fn, inf, "error", None, time.perf_counter()
+                )
                 for config in configs
             ]
 
@@ -2674,6 +2715,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 compile_time=result.compile_time,
                 config_id=config_id,
                 config=config,
+                objective=result.perf,
+                objective_unit="ratio" if self.args.relative_to is not None else "ms",
+                completed_at=result.completed_at,
             )
         )
 
@@ -2694,6 +2738,27 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         if summary is not None:
             self.log(summary)
 
+    def _record_rebenchmark_result(self, result: BenchmarkResult) -> None:
+        config_id = self.log.register_config(result.config)
+        assert config_id is not None
+        self.log.record_trace_entry(
+            AutotuneLogEntry(
+                generation=self._autotune_metrics.num_generations,
+                status=result.status,
+                perf_ms=(
+                    self.raw_latency(result.config)
+                    if math.isfinite(result.perf)
+                    else None
+                ),
+                compile_time=result.compile_time,
+                config_id=config_id,
+                config=result.config,
+                objective=result.perf,
+                objective_unit="ratio" if self.args.relative_to is not None else "ms",
+            ),
+            event="rebenchmark",
+        )
+
     def rebenchmark(
         self,
         configs: list[Config],
@@ -2709,4 +2774,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             record_results=False,
             check_budget=False,
         )
+        if self.log.trace_enabled:
+            for result in results:
+                self._record_rebenchmark_result(result)
         return [result.perf for result in results]
