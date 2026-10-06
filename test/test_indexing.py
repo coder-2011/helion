@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import math
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +11,11 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
+from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
+
 import helion
 from helion import _compat
 from helion import exc
@@ -16,6 +23,8 @@ from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.backend import validate_thread_axis_accesses
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -30,6 +39,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
@@ -76,6 +86,17 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
         out[tile] = x[tile, :].to(torch.float32).sum(-1).to(x.dtype)
 
     return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _computed_tile_coordinates(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    prefix = torch.empty_like(x)
+    reused = torch.empty_like(x)
+    for row, col in hl.tile(x.shape, block_size=[2, 32]):
+        values = (row.index[:, None] * x.size(1) + col.index[None, :]).to(torch.float32)
+        prefix[row, col] = hl.cumsum(values, dim=-1)
+        reused[row, col] = values + 1
+    return prefix, reused
 
 
 @onlyBackends(["triton", "cute"])
@@ -3345,20 +3366,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @onlyBackends(["cute", "triton"])
     def test_computed_tile_coordinates_with_singleton_views(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def coordinates(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            prefix = torch.empty_like(x)
-            reused = torch.empty_like(x)
-            for row, col in hl.tile(x.shape, block_size=[2, 32]):
-                values = (row.index[:, None] * x.size(1) + col.index[None, :]).to(
-                    torch.float32
-                )
-                prefix[row, col] = hl.cumsum(values, dim=-1)
-                reused[row, col] = values + 1
-            return prefix, reused
-
         x = torch.zeros(5, 65, device=DEVICE)
-        _, (prefix, reused) = code_and_output(coordinates, (x,))
+        _, (prefix, reused) = code_and_output(_computed_tile_coordinates, (x,))
         values = torch.arange(5 * 65, device=DEVICE, dtype=x.dtype).reshape(5, 65)
         expected = torch.cat([part.cumsum(-1) for part in values.split(32, -1)], -1)
         torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
@@ -3479,3 +3488,172 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("mode", ["serial", "cooperative"])
+def test_computed_tile_grid_ownership_codegen(mode):
+    kernel = helion.kernel(
+        _computed_tile_coordinates.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(kernel, (torch.zeros(5, 65),))
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_scan"] = mode
+        code = bound.to_code(config)
+    validate_thread_axis_accesses(ast.parse(code).body)
+    assert "fragment_thread" in code
+    assert "block=(128, 1, 1)" in code
+    assert "thread_idx()[3]" not in code
+
+
+@pytest.mark.parametrize(
+    "source,valid",
+    [
+        ("value = cute.arch.thread_idx()[0]", True),
+        ("value = cute.arch.thread_idx()[1]", True),
+        ("value = cute.arch.thread_idx()[2]", True),
+        ("x, y, z = cute.arch.thread_idx()", True),
+        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[2]", True),
+        ("value = cute.arch.thread_idx()[3]", False),
+        ("value = cute.arch.thread_idx()[-1]", False),
+        ("value = cute.arch.thread_idx()[axis]", False),
+        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[4]", False),
+        ("if predicate:\n    value = cute.arch.thread_idx()[3]", False),
+    ],
+)
+def test_cute_final_thread_axis_validation(source, valid):
+    if valid:
+        validate_thread_axis_accesses(ast.parse(source).body)
+    else:
+        with pytest.raises(exc.BackendUnsupported, match="thread axis"):
+            validate_thread_axis_accesses(ast.parse(source).body)
+
+
+def test_cute_live_invalid_grid_axis_rejected_after_codegen():
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add_one(x: torch.Tensor):
+        out = torch.empty_like(x)
+        for row, col in hl.tile(x.shape, block_size=[2, 32]):
+            out[row, col] = x[row, col] + 1
+        return out
+
+    original_grid_index = CuteBackend.grid_index_expr
+
+    def invalid_grid_index(self, offset_var, block_size_var, dtype, *, axis):
+        return original_grid_index(self, offset_var, block_size_var, dtype, axis=3)
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch.object(CuteBackend, "grid_index_expr", invalid_grid_index),
+    ):
+        bound = _cpu_bind(add_one, (torch.zeros(5, 65),))
+        with pytest.raises(exc.BackendUnsupported, match="thread axis 3"):
+            bound.to_code(bound.config_spec.default_config())
+
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def _config_derived_iota(x: torch.Tensor, stepped: hl.constexpr):
+    block = hl.register_block_size(x.size(1))
+    count = (x.size(1) + block - 1) // block
+    scratch = torch.zeros((x.size(0), count), device=x.device, dtype=x.dtype)
+    out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+    for row in hl.tile(x.size(0)):
+        values = scratch[row, :]
+        if stepped:
+            indices = hl.arange(3, 3 + 2 * values.size(-1), 2, dtype=torch.int64)
+        else:
+            indices = hl.arange(values.size(-1))
+        out[row] = (values + indices[None, :].float()).sum(-1)
+    return out
+
+
+@pytest.mark.parametrize("stepped", [False, True])
+@pytest.mark.parametrize("reduction_block", [None, 2])
+@pytest.mark.parametrize("block", [16, 32])
+def test_triton_config_derived_iota_codegen(
+    block: int, reduction_block: int | None, stepped: bool
+):
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(_config_derived_iota, (torch.ones(3, 65), stepped))
+        config = bound.config_spec.default_config()
+        cast("list[int]", config["block_sizes"])[0] = block
+        config.config["reduction_loops"] = [reduction_block]
+        code = bound.to_code(config)
+    tree = ast.parse(code)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    constexprs = {
+        arg.arg
+        for arg in function.args.args
+        if arg.annotation is not None and ast.unparse(arg.annotation) == "tl.constexpr"
+    }
+    constexprs.update(
+        node.targets[0].id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "tl.constexpr"
+    )
+    for call in ast.walk(function):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and ast.unparse(call.func) == "tl.arange"
+        ):
+            end = call.args[1]
+            assert isinstance(end, ast.Constant) or (
+                isinstance(end, ast.Name) and end.id in constexprs
+            ), ast.unparse(call)
+    # The physical iota is masked by the logical, unpadded count. Rolled
+    # reductions must use their global reduction coordinate on later tiles.
+    assert "< count" in code
+    if reduction_block is not None:
+        assert "rindex_" in code
+        assert "roffset_" in code
+    if stepped:
+        assert "tl.int64" in code
+
+
+@skipUnlessBackends(["triton"])
+@pytest.mark.parametrize("stepped", [False, True])
+@pytest.mark.parametrize("reduction_block", [None, 2])
+@pytest.mark.parametrize("block", [16, 32])
+def test_triton_config_derived_iota_values(
+    block: int, reduction_block: int | None, stepped: bool
+):
+    kernel = helion.kernel(
+        _config_derived_iota.fn,
+        backend="triton",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    x = torch.zeros((3, 65), device=DEVICE)
+    bound = kernel.bind((x, stepped))
+    config = bound.config_spec.default_config()
+    cast("list[int]", config["block_sizes"])[0] = block
+    config.config["reduction_loops"] = [reduction_block]
+    count = (65 + block - 1) // block
+    indices = torch.arange(count, device=DEVICE)
+    if stepped:
+        indices = 3 + 2 * indices
+    expected = indices.sum().float().expand(3)
+    torch.testing.assert_close(bound.compile_config(config)(x, stepped), expected)
