@@ -645,6 +645,9 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
     n_pow2 = next_power_of_2(n_hint)
     k_pow2 = next_power_of_2(k)
 
+    if input_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return _codegen_float_topk(ctx, tensor, input_tensor, k_pow2, largest)
+
     # Generate top-k values using tl.topk (for largest=True) or tl.sort (for largest=False)
     topk_vals = ctx.cg.device_function.new_var("topk_vals")
     if largest:
@@ -754,3 +757,74 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
         )
 
     return (expr_from_string(topk_vals), expr_from_string(topk_indices))
+
+
+def _codegen_float_topk(
+    ctx: LoweringContext,
+    tensor: ast.AST,
+    input_tensor: torch.Tensor,
+    k: int,
+    largest: bool,
+) -> tuple[ast.AST, ast.AST]:
+    """Select ordered value/index keys without quadratic rank tensors.
+
+    FP16/BF16 values promote exactly to FP32 for comparison. Original payloads
+    are gathered after selection, preserving signed zeros and NaN payload bits.
+    NaNs compare above infinity; equal values select the lowest original index.
+    Padding is outside the valid key range in either ordering direction.
+    """
+    fn = ctx.cg.device_function
+    env = CompileEnvironment.current()
+    shape = list(input_tensor.shape)
+    suffix = "[" + ", ".join(["None"] * (len(shape) - 1) + [":"]) + "]"
+    index = fn.new_var("topk_index")
+    bits = fn.new_var("topk_bits")
+    ordered = fn.new_var("topk_ordered")
+    keys = fn.new_var("topk_keys")
+    selected = fn.new_var("topk_selected")
+    indices = fn.new_var("topk_indices")
+    values = fn.new_var("topk_values")
+
+    def emit(source: str) -> None:
+        ctx.cg.add_statement(statement_from_string(source, tensor=tensor))
+
+    emit(f"{index} = tl.arange(0, {{tensor}}.shape[-1]).to(tl.uint32)")
+    emit(f"{bits} = {{tensor}}.to(tl.float32).to(tl.uint32, bitcast=True)")
+    emit(f"{bits} = tl.where(({bits} & 0x7fffffff) == 0, 0, {bits})")
+    emit(
+        f"{ordered} = tl.where(({bits} & 0x80000000) != 0, {bits} ^ 0xffffffff, {bits} ^ 0x80000000)"
+    )
+    emit(
+        f"{ordered} = tl.where(({bits} & 0x7fffffff) > 0x7f800000, 0xffffffff, {ordered})"
+    )
+    tie = f"({index} ^ 0xffffffff)" if largest else index
+    emit(f"{keys} = ({ordered}.to(tl.uint64) << 32) | {tie}{suffix}.to(tl.uint64)")
+
+    axis = env.resolve_block_id(shape[-1])
+    logical = (
+        env.block_sizes[axis].numel
+        if axis is not None and env.block_sizes[axis].reduction
+        else shape[-1]
+    )
+    masks = [f"({index}{suffix} < {fn.literal_expr(logical)})"]
+    # Reuse ordinary live-axis masks for independently tiled axes and tails.
+    # A padding value equal to a real infinity/NaN must still lose selection.
+    for dim, size in enumerate(shape):
+        block = env.resolve_block_id(size)
+        if block is not None and (mask := fn.codegen.mask_var(block)) is not None:
+            expand = fn.tile_strategy.expand_str(shape, dim)
+            masks.append(f"({mask}{expand})")
+    invalid = "0" if largest else "0xffffffffffffffff"
+    emit(
+        f"{keys} = tl.where({' & '.join(masks)}, {keys}, tl.full([], {invalid}, tl.uint64))"
+    )
+    emit(f"{selected} = tl.topk({keys}, {k}, descending={largest})")
+    decoded = f"{selected}.to(tl.uint32)"
+    if largest:
+        decoded = f"({decoded} ^ 0xffffffff)"
+    emit(f"{indices} = ({decoded}).to(tl.int64)")
+    # Dummy K-padding slots are not stored but still participate in tl.gather.
+    emit(
+        f"{values} = tl.gather({{tensor}}, tl.minimum({indices}, {{tensor}}.shape[-1] - 1).to(tl.int32), axis={len(shape) - 1})"
+    )
+    return expr_from_string(values), expr_from_string(indices)
