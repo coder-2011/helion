@@ -1,4 +1,4 @@
-"""CuTe top-k lowering, selection networks, tuning, and correctness tests."""
+"""Top-k lowering, selection networks, tuning, and correctness tests."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ import dataclasses
 import gc
 import itertools
 import operator
+import os
+from pathlib import Path
 import random
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -40,34 +45,143 @@ from helion._compiler.cute.topk import _match_direct_topk_root
 from helion._compiler.cute.topk import match_topk_root
 from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
+from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.aot_structural_policy import model_configs
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytest.importorskip("cutlass")
-pytest.importorskip("cutlass.cute")
-
-import cutlass
-import cutlass.cute as cute
 
 from helion.runtime import default_cute_launcher
-from helion.runtime.cute.register_layout import subgroup_unvectorize
-from helion.runtime.cute.register_layout import subgroup_vectorize
 from helion.runtime.cute.sorting_networks import COMPACT_SORT_LAYERS
-from helion.runtime.cute.topk import _balanced_chunk_program
-from helion.runtime.cute.topk import _odd_even_sort_network
-from helion.runtime.cute.topk import _pruned_sort_network
-from helion.runtime.cute.topk import _sort_network
-from helion.runtime.cute.topk import _use_pruned_sort_network
 
 # Basic top-k tests.
+
+
+def test_topk_collection_without_cute(tmp_path: Path) -> None:
+    """A Triton-only installation keeps portable tests and skips CuTe tests."""
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.modules["cutlass"] = None
+        sys.modules["cutlass.cute"] = None
+
+        import pytest
+
+        class Results:
+            def __init__(self):
+                self.nodes = []
+                self.reports = []
+
+            def pytest_collection_modifyitems(self, items):
+                self.nodes = [item.nodeid for item in items]
+
+            def pytest_runtest_logreport(self, report):
+                if report.when == "call" or report.skipped:
+                    self.reports.append((report.outcome, str(report.longrepr)))
+
+        collected = Results()
+        assert pytest.main([
+            "test/test_cute_topk.py::TestTorchTopK", "--collect-only", "-q"
+        ], plugins=[collected]) == 0
+        assert {node.rsplit("::", 1)[-1] for node in collected.nodes} == {
+            "test_torch_topk_in_kernel", "test_torch_topk_smallest"
+        }
+
+        executed = Results()
+        assert pytest.main([
+            "test/test_cute_topk.py::test_pretuned_topk_registration_and_keys",
+            "test/test_cute_topk.py::test_compact_network_bounds_and_operation_count",
+            "-q"
+        ], plugins=[executed]) == 0
+        assert [outcome for outcome, _ in executed.reports] == ["passed", "skipped"]
+        assert "CuTe DSL" in executed.reports[1][1]
+        """
+    )
+    probe = tmp_path / "without_cute.py"
+    probe.write_text(script)
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HELION_BACKEND": "triton"}
+    env["PYTHONPATH"] = str(root)
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@onlyBackends(["triton", "cute"])
+class TestTorchTopK(RefEagerTestBase, TestCase):
+    @skipIfXPU("Triton topk produces incorrect values on XPU")
+    def test_torch_topk_in_kernel(self):
+        """Return the largest values and their original column indices."""
+
+        @helion.kernel()
+        def topk_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            k = hl.specialize(k)
+            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=True)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        k = 4
+        code, (vals, indices) = code_and_output(topk_kernel, (x, k))
+
+        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=True)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        if _get_backend() == "triton":
+            # Uses tl.topk for largest=True
+            self.assertIn("tl.topk", code)
+
+    @skipIfXPU("Triton topk produces incorrect values on XPU")
+    def test_torch_topk_smallest(self):
+        """Test torch.topk with largest=False (k smallest elements)."""
+
+        @helion.kernel()
+        def topk_smallest_kernel(
+            x: torch.Tensor, k: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            k = hl.specialize(k)
+            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
+            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=False)
+                out_vals[tile_m, :] = vals
+                out_indices[tile_m, :] = indices
+            return out_vals, out_indices
+
+        x = torch.randn(4, 16, device=DEVICE)
+        k = 4
+        code, (vals, indices) = code_and_output(topk_smallest_kernel, (x, k))
+
+        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=False)
+        torch.testing.assert_close(vals, ref_vals)
+        torch.testing.assert_close(indices, ref_indices)
+        if _get_backend() == "triton":
+            # Ordered floating keys support native ascending selection.
+            self.assertIn("tl.topk", code)
+            self.assertIn("descending=False", code)
+            self.assertNotIn("tl.sort", code)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -88,6 +202,8 @@ def _row_topk(
 @pytest.mark.parametrize("backend", ["cute", "triton"])
 @pytest.mark.parametrize("operation", ["topk", "sort"])
 def test_ordering_axis_keeps_complete_reduction_input(backend, operation):
+    if backend == "cute":
+        pytest.importorskip("cutlass.cute")
     function = _row_topk.fn if operation == "topk" else _row_network_sort.fn
     inputs = (
         (torch.ones(3, 8192), 64, True)
@@ -191,6 +307,7 @@ def _interpret_triton_selection(source, inputs, path, monkeypatch):
     import sys
 
     from triton.runtime.interpreter import InterpretedFunction
+    from triton.runtime.interpreter import _patch_lang
     from triton.runtime.jit import JITFunction
 
     path.write_text(source)
@@ -205,7 +322,15 @@ def _interpret_triton_selection(source, inputs, path, monkeypatch):
         # its existing JIT helpers through the same interpreter, without
         # replacing top-k/sort arithmetic with a reference implementation.
         def device_call(function, *values, **options):
-            return InterpretedFunction(function.fn)(*values, **options)
+            interpreted = InterpretedFunction(function.fn)
+            # InterpretedFunction.__call__ patches each helper's language
+            # namespace without restoring it. Helpers may import tl.core,
+            # which the outer grid's tl patch does not cover.
+            scope = _patch_lang(function.fn)
+            try:
+                return interpreted.rewrite()(*values, **options)
+            finally:
+                scope.restore()
 
         with patch.object(JITFunction, "__call__", device_call):
             return InterpretedFunction(kernel.fn)[grid](*args, **kwargs)
@@ -216,6 +341,46 @@ def _interpret_triton_selection(source, inputs, path, monkeypatch):
         if isinstance(node, ast.FunctionDef)
     )
     return vars(module)[function](*inputs, _launcher=launch)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_triton_selection_interpreter_restores_language(fail, tmp_path, monkeypatch):
+    import triton.language as tl
+    from triton.runtime.interpreter import InterpreterError
+
+    source = f"""
+import triton
+import triton.language as tl
+
+@triton.jit
+def kernel(x, out):
+    index = tl.arange(0, 4)
+    value = tl.topk(tl.load(x + index), 2)
+    tl.static_assert(not {fail!r}, "expected interpreter failure")
+    tl.store(out + tl.arange(0, 2), value)
+
+def wrapper(x, out, *, _launcher):
+    _launcher(kernel, (1,), x, out)
+    return out
+"""
+    namespaces = (tl, tl.core, tl.math, tl.tensor, tl.dtype)
+    originals = [(obj, vars(obj).copy()) for obj in namespaces]
+    x = torch.arange(4, dtype=torch.float32)
+    out = torch.empty(2, dtype=x.dtype)
+    with patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")):
+        if fail:
+            with pytest.raises(InterpreterError, match="expected interpreter failure"):
+                _interpret_triton_selection(
+                    source, (x, out), tmp_path / "generated.py", monkeypatch
+                )
+        else:
+            actual = _interpret_triton_selection(
+                source, (x, out), tmp_path / "generated.py", monkeypatch
+            )
+            torch.testing.assert_close(actual, x.topk(2).values, rtol=0, atol=0)
+    for obj, attributes in originals:
+        for name, value in attributes.items():
+            assert vars(obj)[name] is value, (obj.__name__, name)
 
 
 def _packed_topk_inputs(width, dtype):
@@ -343,6 +508,7 @@ def _inputs(width: int, dtype: torch.dtype) -> torch.Tensor:
     return x.to(DEVICE)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @onlyBackends(["cute"])
 @pytest.mark.parametrize(
     "dtype,width,k,largest,lanes",
@@ -393,6 +559,7 @@ def _topk_and_copy(
     return values, indices, copied
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @onlyBackends(["cute"])
 def test_direct_topk_preserves_other_stores() -> None:
     """Register selection composes with an independent full-width output."""
@@ -424,6 +591,7 @@ def _alignment_relaunch_topk(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_same_topk_launcher_aligned_shifted_aligned() -> None:
     rows, width, k = 17, 64, 3
@@ -1380,6 +1548,7 @@ def _code(
         return bound.to_triton_code(config)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("vector", [1, 2, 4, 8])
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
@@ -1407,6 +1576,7 @@ def test_topk_index_output_dtype_codegen(
     assert "topk_row = cutlass.Int32(" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("rows,stride", [(1, 2**35), (268435457, 0)])
 def test_topk_output_dtype_does_not_narrow_addresses(
@@ -1418,6 +1588,7 @@ def test_topk_output_dtype_does_not_narrow_addresses(
     assert "topk_output_offset = topk_row * cutlass.Int64(8)" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("index_dtype", [torch.int16, torch.float32])
 def test_topk_fragment_supports_other_index_store_dtypes(
     index_dtype: torch.dtype,
@@ -1427,6 +1598,7 @@ def test_topk_fragment_supports_other_index_store_dtypes(
     assert "sort_rank" not in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_topk_fragment_supports_arithmetic_before_index_narrowing() -> None:
     code = _code(
         5, 64, 64, 32, index_dtype=torch.int32, kernel=_transformed_indices_topk
@@ -1435,6 +1607,7 @@ def test_topk_fragment_supports_arithmetic_before_index_narrowing() -> None:
     assert "sort_rank" not in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "index_dtype,transform",
@@ -1456,6 +1629,7 @@ def test_topk_composition_index_store_casts(
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "rows,cols,stride,k,wide",
     [
@@ -1476,6 +1650,7 @@ def test_topk_wide_address_codegen(
     assert "_cute_local_topk_" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "rows,cols,stride,k,vector,wide",
     [
@@ -1506,6 +1681,7 @@ def test_topk_output_vector_address_codegen(
     assert f"topk_lane * cutlass.Int32({vector})" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_topk_odd_output_stride_uses_scalar_stores() -> None:
     code = _code(17, 64, 64, 17, 8)
     assert "_cute_local_topk" in code
@@ -1513,6 +1689,7 @@ def test_topk_odd_output_stride_uses_scalar_stores() -> None:
     assert "cute.assume(topk_output_offset" not in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
@@ -1650,6 +1827,7 @@ def test_topk_decode_all_16bit_inputs(
         assert ranks[32768] == (-1 if largest else 1)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_topk_decode_keeps_wide_vector_output_addresses() -> None:
     code = _code(268435457, 8, 0, 8, 8, value_mode="decode")
     assert "topk_row * cutlass.Int64(8) + cutlass.Int64(topk_output_col)" in code
@@ -1657,6 +1835,7 @@ def test_topk_decode_keeps_wide_vector_output_addresses() -> None:
     assert "values.iterator.alignment >= 16" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "cols,key_dtype,selected_dtype",
     [
@@ -1916,6 +2095,7 @@ def test_distributed_topk_wider_than_k_random(lanes: int) -> None:
                 assert _simulate_distributed_topk(inputs, k) == expected
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "n,k,lanes,vector,fragment",
     [
@@ -1937,6 +2117,7 @@ def test_distributed_fragment_does_not_pad_every_lane_to_k(
     assert f"topk_keys = cute.make_rmem_tensor({fragment}, cutlass.Int32)" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
@@ -1948,6 +2129,7 @@ def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
     assert f"(topk_keys, 32, 2, '{network}', 'sequential')" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_topk_cache_hash_includes_compact_tables() -> None:
     from helion._compiler.cute import topk_codegen
 
@@ -1966,6 +2148,7 @@ def test_topk_cache_hash_includes_compact_tables() -> None:
     assert "_cute_local_topk_" in before and "_cute_local_topk_" in after
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "k,lanes",
     [(3, 8), (3, 4), (6, 2), (33, 1), (32, 16), (1, 32), (8, 32)],
@@ -1994,6 +2177,7 @@ def test_topk_distributed_codegen_guard(k: int, lanes: int, key_dtype: str) -> N
         assert f"topk_output_col < cutlass.Int32({k})" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("rows,stride", [(1, 2**35), (268435457, 0)])
 def test_topk_distributed_keeps_wide_addresses(rows: int, stride: int) -> None:
     code = _code(
@@ -2059,6 +2243,7 @@ def test_distributed_output_transpose_rank_mapping(
             assert ranks[lane] == expected
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
 @pytest.mark.parametrize(
     "k,lanes,requested,effective",
@@ -2123,6 +2308,7 @@ def _out_topk(x: torch.Tensor, values: torch.Tensor, indices: torch.Tensor) -> N
         indices[row, :] = idx
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
 @pytest.mark.parametrize("alias_target", ["values", "indices"])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
@@ -2259,6 +2445,7 @@ def test_native_bfloat_bias_exhaustive(index_bits: int, largest: bool) -> None:
     assert bool((maximum[:-1][distinct] < minimum[1:][distinct]).all())
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("largest", [False, True])
 def test_native_float_bias_codegen(dtype: torch.dtype, largest: bool) -> None:
@@ -2281,6 +2468,7 @@ def test_native_float_bias_codegen(dtype: torch.dtype, largest: bool) -> None:
     assert ("topk_native_key = -topk_native_key" in code) == (not largest)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "dtype,width,native",
     [
@@ -2308,6 +2496,9 @@ def test_native_float_width_guard(dtype: torch.dtype, width: int, native: bool) 
 
 
 def _evaluate(values: np.ndarray, size: int, k: int, network: str) -> np.ndarray:
+    from helion.runtime.cute.topk import _pruned_sort_network
+    from helion.runtime.cute.topk import _sort_network
+
     actual = values.copy()
     program = (
         _pruned_sort_network(size, k)
@@ -2325,6 +2516,7 @@ def _evaluate(values: np.ndarray, size: int, k: int, network: str) -> np.ndarray
     return actual[:, :k]
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 def test_selection_network_exhaustive_binary(size: int, network: str) -> None:
@@ -2341,6 +2533,7 @@ def test_selection_network_exhaustive_binary(size: int, network: str) -> None:
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size", [32, 64, 128, 256])
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 @pytest.mark.parametrize("floating", [False, True])
@@ -2365,7 +2558,11 @@ def test_selection_network_random_duplicates_and_padding(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_compact_network_bounds_and_operation_count() -> None:
+    from helion.runtime.cute.topk import _pruned_sort_network
+    from helion.runtime.cute.topk import _sort_network
+
     for size, layers in COMPACT_SORT_LAYERS.items():
         for layer in layers:
             wires = [wire for pair in layer for wire in pair]
@@ -2383,8 +2580,13 @@ def test_compact_network_bounds_and_operation_count() -> None:
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 def test_network_dispatch_and_power_two_fallback(size: int) -> None:
+    from helion.runtime.cute.topk import _odd_even_sort_network
+    from helion.runtime.cute.topk import _sort_network
+    from helion.runtime.cute.topk import _use_pruned_sort_network
+
     assert not _use_pruned_sort_network(size, "batcher")
     assert not _use_pruned_sort_network(size, "compact")
     assert _use_pruned_sort_network(size, "compact_pruned") == (
@@ -2395,8 +2597,11 @@ def test_network_dispatch_and_power_two_fallback(size: int) -> None:
         assert _sort_network(size, "compact_pruned") == _odd_even_sort_network(size)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size,k", [(0, 1), (3, 1), (8, 0), (8, 3), (8, 16)])
 def test_pruned_network_rejects_invalid_sizes(size: int, k: int) -> None:
+    from helion.runtime.cute.topk import _pruned_sort_network
+
     with pytest.raises(AssertionError):
         _pruned_sort_network(size, k)
 
@@ -2452,6 +2657,7 @@ def test_ordered_key_asm_exhaustive(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "width,key_dtype,ordered",
@@ -2574,6 +2780,7 @@ def test_packed_rare_config(
     assert invalid_config[key] == default
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "width,k,lanes,vector,layout,key_dtype,rank_mode,value_mode,active",
     [
@@ -2641,6 +2848,7 @@ def test_packed_rare_codegen_guard(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_packed_rare_wide_addresses(index_dtype: torch.dtype) -> None:
     code = _code(
@@ -2787,6 +2995,7 @@ def test_packed_rare_alignment_transition(
 # Endpoints top-k tests.
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "k,lanes,requested,layout,last",
     [
@@ -2920,6 +3129,7 @@ def test_packed_endpoint_non_power_two_k(
 
 @pytest.fixture
 def cpu_codegen() -> Iterator[None]:
+    pytest.importorskip("cutlass.cute")
     with (
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
         patch(
@@ -2958,6 +3168,7 @@ def _config(encoder: str) -> helion.Config:
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("retain_input", [False, True])
 def test_cached_topk_recompiles_after_construction_tensors_expire(
@@ -2989,6 +3200,7 @@ def test_cached_topk_recompiles_after_construction_tensors_expire(
     assert (retained is not None) == retain_input
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("alias_kind", ["view", "dlpack"])
 @pytest.mark.parametrize("width", [1, 32])
@@ -3019,6 +3231,7 @@ def test_cached_topk_alias_binding_stays_rejected_after_release(
         assert ("_cute_local_topk" in code) == expected
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
@@ -3056,6 +3269,7 @@ def test_singleton_topk_search_and_recompile_after_input_release(
     assert "_cute_local_topk" in bound.to_triton_code(config)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize(
     "damage",
@@ -3110,6 +3324,7 @@ def test_cached_topk_alias_fact_requires_matching_descriptor(damage: str) -> Non
         assert topk_tensors_are_proven_disjoint(candidate, env) == (damage == "none")
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize(
     "damage",
@@ -3195,6 +3410,8 @@ def _merge(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
 
 def _select(values: np.ndarray, k: int, network: str) -> np.ndarray:
+    from helion.runtime.cute.topk import _balanced_chunk_program
+
     partials: dict[int, np.ndarray] = {}
     for left, right in _balanced_chunk_program(values.shape[1] // k):
         if left == right:
@@ -3207,6 +3424,7 @@ def _select(values: np.ndarray, k: int, network: str) -> np.ndarray:
     return partials[0]
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("network", ["batcher", "compact"])
 def test_balanced_exhaustive_binary(size: int, network: str) -> None:
@@ -3219,6 +3437,7 @@ def test_balanced_exhaustive_binary(size: int, network: str) -> None:
         np.testing.assert_array_equal(_select(values, k, network), expected[:, :k])
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("size", [32, 64, 128, 256])
 @pytest.mark.parametrize("network", ["batcher", "compact"])
 @pytest.mark.parametrize("floating", [False, True])
@@ -3240,8 +3459,11 @@ def test_balanced_random_duplicates_padding(
         np.testing.assert_array_equal(_select(values, k, network), expected[:, :k])
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("chunks", [1, 2, 4, 8, 16, 32])
 def test_balanced_schedule_equal_adjacent_groups(chunks: int) -> None:
+    from helion.runtime.cute.topk import _balanced_chunk_program
+
     groups: dict[int, int] = {}
     merges = 0
     for left, right in _balanced_chunk_program(chunks):
@@ -3259,6 +3481,9 @@ def test_balanced_schedule_equal_adjacent_groups(chunks: int) -> None:
 def _operation_count_and_depth(
     size: int, k: int, network: str, balanced: bool
 ) -> tuple[int, int]:
+    from helion.runtime.cute.topk import _balanced_chunk_program
+    from helion.runtime.cute.topk import _sort_network
+
     depths: dict[int, list[int]] = {}
     operations = 0
     chunks = size // k
@@ -3298,6 +3523,7 @@ def _operation_count_and_depth(
     return operations, max(depths[0])
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "size,k,operations,sequential,balanced",
     [
@@ -3337,6 +3563,7 @@ def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) 
             spec.normalize(helion.Config(cute_topk_merge_schedule=invalid))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
 def test_balanced_schedule_reaches_codegen(layout: str, network: str) -> None:
@@ -3437,6 +3664,7 @@ def test_balanced_gpu_exact_selected_bits(
         assert bool((indices_storage[:offset] == -7).all())
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("encoder", ["dsl", "asm"])
 @pytest.mark.parametrize("largest", [False, True])
 def test_balanced_endpoint_codegen_composition(encoder: str, largest: bool) -> None:
@@ -3512,6 +3740,7 @@ def test_balanced_asm_endpoint_exact_selected_bits(
 
 @pytest.fixture
 def _cpu_compile_environment() -> Iterator[None]:
+    pytest.importorskip("cutlass.cute")
     with (
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
         patch(
@@ -3527,6 +3756,7 @@ def _cpu_compile_environment() -> Iterator[None]:
         yield
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize(
     "cols,k,primary_lanes",
@@ -3579,6 +3809,7 @@ def test_topk_seeds_follow_fragment_geometry(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
@@ -3639,6 +3870,7 @@ def test_topk_new_seeds_cover_growing_and_native_fragments(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize(
     "dtype,inner_stride,supported",
@@ -3680,6 +3912,7 @@ def test_topk_seeds_follow_root_capabilities(
         assert "sort_rank" not in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
 def test_topk_seeds_require_final_runtime_alias_proof(alias_kind: str) -> None:
@@ -3701,6 +3934,7 @@ def test_topk_seeds_require_final_runtime_alias_proof(alias_kind: str) -> None:
     assert bool(seeds) == (alias_kind == "separate")
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
 @pytest.mark.parametrize("disable_heuristics", [False, True])
@@ -3748,6 +3982,7 @@ def test_topk_alias_fallback_retains_generic_search(
         assert "cute_topk_lanes_per_row" not in large
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 def test_topk_seeds_registry_cache_and_disable_integration() -> None:
     assert CuteTopKHeuristic in get_heuristics("cute")
@@ -3768,6 +4003,7 @@ def test_topk_seeds_registry_cache_and_disable_integration() -> None:
     assert disabled.config_spec.compiler_default_config is None
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
@@ -3917,6 +4153,7 @@ def test_paired_ordinal_exhaustive(infinity: int, bits: int, largest: bool) -> N
                     assert bool((floating > 0).all())
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "cols,stride,vector,rank,key,active",
     [
@@ -3970,6 +4207,7 @@ def test_paired_encoder_codegen_scope(
         assert "_cute_encode_ordered_topk" in code  # Scalar ABI fallback.
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_paired_encoder_keeps_wide_address_math() -> None:
     code = _code(
         1, 128, 2**35, 32, 4, lanes=2, key_encoder="paired", rank_mode="ordinal"
@@ -4079,6 +4317,7 @@ def test_paired_encoder_same_bound_alignment_transition(
 # Wide output top-k tests.
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("largest", [True, False])
 @pytest.mark.parametrize(
@@ -4218,6 +4457,7 @@ def _softmax_row_topk(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize(
     "k,lanes,vector", [(1, 16, 1), (3, 8, 1), (8, 16, 4), (32, 2, 8)]
@@ -4241,6 +4481,7 @@ def test_topk_softmax_codegen(layout: str, k: int, lanes: int, vector: int) -> N
     assert code.count("@cute.kernel") == 1
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize(
     "damage",
@@ -4296,6 +4537,7 @@ def test_topk_softmax_matcher_requires_exact_epilogue(damage: str) -> None:
         assert (result is not None) == (damage == "none")
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("largest", [True, False])
@@ -4358,6 +4600,7 @@ def test_topk_softmax_fused_values(
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
@@ -4417,6 +4660,7 @@ def test_topk_softmax_value_recovery(
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("key_dtype", ["int32", "float32_native"])
 @pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
 def test_topk_softmax_decode_eliminates_value_gathers(
@@ -4542,6 +4786,7 @@ def _assert_composed_register_selection(code: str, layout: str) -> None:
     assert code.count("@cute.kernel") == 1
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize(
@@ -4569,6 +4814,7 @@ def test_topk_composition_codegen(kind: str, layout: str) -> None:
     _assert_composed_register_selection(bound.to_code(config), layout)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("destination_columns", [1, 3])
 def test_topk_composition_rejects_mismatched_store_extent(
@@ -4603,6 +4849,7 @@ def test_topk_composition_rejects_mismatched_store_extent(
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "n,k,lanes,layout",
@@ -4641,6 +4888,7 @@ def test_topk_composition_pointwise_outputs(
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "n,k,lanes,layout",
@@ -4680,6 +4928,7 @@ def test_topk_composition_temperature_and_row_reduction(
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "k,lanes,layout", [(3, 8, "distributed"), (8, 16, "replicated")]
@@ -4699,6 +4948,7 @@ def test_topk_composition_broadcasts_row_reduction_store(
     torch.testing.assert_close(values, expected)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -4735,6 +4985,7 @@ def test_topk_composition_preprocess_preserves_selected_bits(
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_row_and_column_broadcast(layout: str) -> None:
@@ -4756,6 +5007,7 @@ def test_topk_composition_row_and_column_broadcast(layout: str) -> None:
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "key_dtype,rank_mode,encoder,lanes",
@@ -4807,6 +5059,7 @@ def _composed_out_topk(
         indices[row, :] = idx + 1
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_topk_composition_strided_memory_preserves_guards() -> None:
     rows, n, k = 9, 65, 3
@@ -4853,6 +5106,7 @@ def _reused_prologue_row_topk(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_reused_prologue_codegen(layout: str) -> None:
@@ -4866,6 +5120,7 @@ def test_topk_composition_reused_prologue_codegen(layout: str) -> None:
         assert "import subgroup_vectorize as" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_reuses_prologue_across_layouts(layout: str) -> None:
@@ -4929,6 +5184,7 @@ def _integer_boolean_reduction_row_topk(
     return index_sum, positive, all_positive, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 @pytest.mark.parametrize("kind", ["expand", "integer_boolean"])
@@ -4942,6 +5198,7 @@ def test_topk_composition_reduction_shapes_codegen(kind: str, layout: str) -> No
     _assert_composed_register_selection(bound.to_code(config), layout)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 def test_topk_composition_rejects_shape_query_arithmetic() -> None:
     bound = _expanded_row_topk._bind_isolated(
@@ -4968,6 +5225,7 @@ def test_topk_composition_rejects_shape_query_arithmetic() -> None:
         )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_expand_as_uses_logical_extent(layout: str) -> None:
@@ -4986,6 +5244,7 @@ def test_topk_composition_expand_as_uses_logical_extent(layout: str) -> None:
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_composition_integer_boolean_reductions(layout: str) -> None:
@@ -5146,6 +5405,7 @@ def _row_network_sort(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("descending", [False, True])
 def test_sort_uses_register_selection_network(descending: bool) -> None:
@@ -5161,6 +5421,7 @@ def test_sort_uses_register_selection_network(descending: bool) -> None:
     assert code.count("@cute.kernel") == 1
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("descending", [False, True])
@@ -5209,6 +5470,7 @@ def _normalized_input_row_topk(
     return values, indices, normalized
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("mode", ["rms", "softmax"])
 @pytest.mark.parametrize("width", [64, 65])
@@ -5222,6 +5484,7 @@ def test_topk_composition_reduces_input_and_vectorizes(mode: str, width: int) ->
     assert "subgroup_vectorize" in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("mode", ["rms", "softmax"])
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
@@ -5272,6 +5535,7 @@ def _ordered_extremum_row_topk(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("k,lanes,scale", [(6, 4, 1.0), (32, 2, 1.0), (6, 4, -1.0)])
 def test_topk_composition_order_fact_is_monotone(
@@ -5284,6 +5548,7 @@ def test_topk_composition_order_fact_is_monotone(
     assert ("row_known_maximum" in code) == (scale > 0)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("k,lanes,scale", [(6, 4, 1.0), (32, 2, 1.0), (6, 4, -1.0)])
 @pytest.mark.parametrize("largest", [False, True])
@@ -5359,6 +5624,7 @@ def _indices_only_composed_row_topk(x: torch.Tensor, k: int) -> torch.Tensor:
     return indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize(
     "mode", ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"]
@@ -5376,6 +5642,7 @@ def test_topk_composition_value_observability_codegen(mode: str) -> None:
     )
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.usefixtures("cpu_codegen")
 def test_topk_composition_indices_only_avoids_value_recovery() -> None:
     x = torch.empty((5, 64), dtype=torch.bfloat16)
@@ -5386,6 +5653,7 @@ def test_topk_composition_indices_only_avoids_value_recovery() -> None:
     assert "topk_value_decodable" not in code
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "mode", ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"]
@@ -5430,38 +5698,47 @@ def test_topk_composition_value_observability(mode: str, layout: str) -> None:
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
-@cute.kernel
-def _subgroup_layout_roundtrip_kernel(
-    x,
-    output,
-    restored,
-    lanes: cutlass.Constexpr,
-    vector: cutlass.Constexpr,
-    registers: cutlass.Constexpr,
-):
-    thread = cute.arch.lane_idx()
-    row = thread // lanes
-    lane = thread % lanes
-    fragment = cute.make_rmem_tensor(registers, x.element_type)
-    for index in cutlass.range_constexpr(registers):
-        fragment[index] = x[row, index * lanes + lane]
-    grouped, output_lane = subgroup_vectorize(fragment, vector, lanes)
-    for index in cutlass.range_constexpr(registers):
-        column = (index // vector * lanes + output_lane) * vector + index % vector
-        output[row, column] = grouped[index]
-    cyclic = subgroup_unvectorize(grouped, vector, lanes)
-    for index in cutlass.range_constexpr(registers):
-        restored[row, index * lanes + lane] = cyclic[index]
-
-
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "dtype", [torch.int32, torch.float32, torch.float16, torch.bfloat16, torch.int64]
 )
 @pytest.mark.parametrize("lanes,vector", [(2, 8), (4, 2), (32, 4)])
 def test_subgroup_vector_layout_roundtrip(
-    dtype: torch.dtype, lanes: int, vector: int
+    dtype: torch.dtype, lanes: int, vector: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import cutlass
+    import cutlass.cute as cute
+
+    from helion.runtime.cute.register_layout import subgroup_unvectorize
+    from helion.runtime.cute.register_layout import subgroup_vectorize
+
+    # CuTe resolves deferred annotations through the original function globals.
+    monkeypatch.setitem(globals(), "cutlass", cutlass)
+
+    @cute.kernel
+    def _subgroup_layout_roundtrip_kernel(
+        x,
+        output,
+        restored,
+        lanes: cutlass.Constexpr,
+        vector: cutlass.Constexpr,
+        registers: cutlass.Constexpr,
+    ):
+        thread = cute.arch.lane_idx()
+        row = thread // lanes
+        lane = thread % lanes
+        fragment = cute.make_rmem_tensor(registers, x.element_type)
+        for index in cutlass.range_constexpr(registers):
+            fragment[index] = x[row, index * lanes + lane]
+        grouped, output_lane = subgroup_vectorize(fragment, vector, lanes)
+        for index in cutlass.range_constexpr(registers):
+            column = (index // vector * lanes + output_lane) * vector + index % vector
+            output[row, column] = grouped[index]
+        cyclic = subgroup_unvectorize(grouped, vector, lanes)
+        for index in cutlass.range_constexpr(registers):
+            restored[row, index * lanes + lane] = cyclic[index]
+
     registers = 16
     shape = (32 // lanes, registers * lanes)
     if dtype in (torch.float16, torch.bfloat16):
@@ -5490,6 +5767,7 @@ def test_subgroup_vector_layout_roundtrip(
     assert torch.equal(x.view(torch.uint8), restored.view(torch.uint8))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
@@ -5553,6 +5831,7 @@ def _fp32_masked_row_topk(
     return output
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("next_n", [1, 2])
 def test_fp32_ordered_selection_runtime_lengths(next_n: int) -> None:
@@ -5590,6 +5869,7 @@ def test_fp32_ordered_selection_config_legality(topk_spec: ConfigSpec) -> None:
     assert spec.cute_topk_choices["cute_topk_defer_value_gathers"] == (False,)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "layout,value_mode", [("distributed", "decode"), ("replicated", "gather")]
@@ -5646,6 +5926,7 @@ def _mixed_dtype_row_topk(
     return values, indices, processed
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -5732,6 +6013,7 @@ def _narrowed_row_topk(
     return values, indices
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
